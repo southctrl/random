@@ -1,0 +1,553 @@
+import asyncio
+import json
+import re
+import time
+import ansi
+
+CATEGORY = "RPC"
+CATEGORY_DESC = "Rich Presence / activity status"
+
+COMMANDS_INFO = {
+    "rpc":     ("rpc <type> [key=value ...]", "Set a rich presence activity"),
+    "rpcstop": ("rpcstop",                    "Clear current rich presence"),
+    "rpchelp": ("rpchelp [type]",             "Show RPC type usage"),
+}
+
+_RPC_TYPES = [
+    "custom_status", "playing", "watching", "listening", "streaming",
+    "competing", "spotify", "youtube", "xbox", "playstation",
+    "crunchyroll", "custom", "clear",
+]
+
+_active_cmd: dict = {}
+_CDN_PAT = r"https?://(?:cdn\.discordapp\.com|media\.discordapp\.net)/attachments/(\d+)/(\d+)/(.+)"
+
+# How often to resend RPC to prevent it being dropped (25 minutes)
+_KEEPALIVE_INTERVAL = 25 * 60
+
+
+async def _refresh_cdn_url(http, spoofer, url: str) -> str:
+    try:
+        headers = spoofer.get_headers(skip_context_props=True)
+        r = await http.post(
+            "https://discord.com/api/v9/attachments/refresh-urls",
+            json={"attachment_urls": [url]},
+            headers=headers,
+        )
+        if r.status_code == 200:
+            refreshed = r.json().get("refreshed_urls", [])
+            if refreshed:
+                return refreshed[0].get("refreshed", url)
+    except Exception as e:
+        print(f"[RPC] refresh url error: {e}")
+    return url
+
+async def _upload_n_get_asset_key(http, spoofer, image_url: str):
+    if re.search(r'https?://(?:cdn\.discordapp\.com|media\.discordapp\.net)', image_url) and '?' in image_url:
+        image_url = await _refresh_cdn_url(http, spoofer, image_url)
+    match = re.search(_CDN_PAT, image_url)
+    if match:
+        ch, att, fn = match.groups()
+        return f"mp:attachments/{ch}/{att}/{fn}"
+    try:
+        print(f"[RPC] downloading image: {image_url}")
+        # FIX: use the existing curl_cffi http session instead of spawning a
+        # new aiohttp.ClientSession on every call (was leaking sessions)
+        r = await http.get(image_url)
+        print(f"[RPC] download status: {r.status_code}")
+        if r.status_code != 200:
+            return None
+        image_bytes = r.content
+        ct = r.headers.get("content-type", r.headers.get("Content-Type", ""))
+        print(f"[RPC] downloaded {len(image_bytes)} bytes, ct={ct}")
+        filename = image_url.split("/")[-1].split("?")[0]
+        if "." not in filename or len(filename) > 50:
+            filename = "asset.gif" if "gif" in ct else "asset.png"
+
+        headers = spoofer.get_headers(skip_context_props=True)
+        me = await http.get("https://discord.com/api/v9/users/@me", headers=headers)
+        if me.status_code != 200:
+            return None
+        uid = me.json()["id"]
+        dm = await http.post(
+            "https://discord.com/api/v9/users/@me/channels",
+            json={"recipient_id": uid},
+            headers=headers,
+        )
+        if dm.status_code not in (200, 201):
+            return None
+        ch_id = dm.json()["id"]
+
+        up_headers = spoofer.get_headers(
+            referer=f"https://discord.com/channels/@me/{ch_id}",
+            skip_context_props=True,
+        )
+        up_headers = {k: v for k, v in up_headers.items() if k.lower() != "content-type"}
+
+        # FIX: use curl_cffi multipart upload instead of aiohttp
+        msg_resp = await http.post(
+            f"https://discord.com/api/v9/channels/{ch_id}/messages",
+            headers=up_headers,
+            files={"files[0]": (filename, image_bytes, ct or "image/png")},
+            data={"payload_json": '{"content":""}'},
+        )
+        if msg_resp.status_code not in (200, 201):
+            return None
+        data = msg_resp.json()
+
+        attachments = data.get("attachments", [])
+        if not attachments:
+            return None
+        new_url = attachments[0]["url"]
+        m2 = re.search(_CDN_PAT, new_url)
+        if not m2:
+            return None
+        c2, a2, f2 = m2.groups()
+        return f"mp:attachments/{c2}/{a2}/{f2}"
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        print(f"[RPC] asset upload error: {e}")
+        return None
+
+
+async def _send_payload(handler, activities: list):
+    gateway = getattr(handler, "gateway", None)
+    if not gateway:
+        raise RuntimeError("Gateway not connected")
+    ws = getattr(gateway, "_ws", None)
+    if not ws:
+        raise RuntimeError("Gateway not connected")
+    payload = {
+        "op": 3,
+        "d": {"since": 0, "activities": activities, "status": "online", "afk": False},
+    }
+    await ws.send_str(json.dumps(payload))
+
+
+async def _build_activity(handler, cmd: dict):
+    http    = handler.http
+    spoofer = handler.spoofer
+    rpc_type = cmd.get("rpc_type", "").lower()
+    t = int(time.time() * 1000)
+
+    def ts_now():
+        return {"start": t}
+
+    def ts_prog(el, tot):
+        cur = int(float(el) * 60000)
+        return {"start": t - cur, "end": t - cur + int(float(tot) * 60000)}
+
+    def mk_buttons(act):
+        btns  = cmd.get("buttons") or []
+        burls = cmd.get("button_urls") or []
+        pairs = [(b, u) for b, u in zip(btns, burls) if b and u][:2]
+        if pairs:
+            act["buttons"] = [p[0] for p in pairs]
+            act.setdefault("metadata", {})["button_urls"] = [p[1] for p in pairs]
+
+    async def img(fallback):
+        u = cmd.get("image_url", "")
+        if not u or not u.startswith("http"):
+            return fallback
+        key = await _upload_n_get_asset_key(http, spoofer, u)
+        return key if key else fallback
+
+    def mk_assets(large_image, large_text="", small_image="", small_text=""):
+        a = {}
+        if large_image: a["large_image"] = large_image
+        if large_text:  a["large_text"]  = large_text
+        if small_image: a["small_image"] = small_image
+        if small_text:  a["small_text"]  = small_text
+        return a if a else None
+
+    if rpc_type == "clear":
+        return None
+
+    if rpc_type == "custom_status":
+        invis = cmd.get("invisible", False)
+        txt   = "\u200e" if invis else cmd.get("text", "")[:128]
+        emoji = cmd.get("emoji", "")
+        act   = {"type": 4, "name": "Custom Status", "state": txt}
+        if emoji:
+            act["emoji"] = {"name": emoji, "id": None, "animated": False}
+        return act
+
+    if rpc_type == "spotify":
+        song   = cmd.get("song", "Unknown")
+        artist = cmd.get("artist", "Unknown")
+        album  = cmd.get("album", "")
+        dur    = float(cmd.get("duration", 3.5))
+        pos    = float(cmd.get("current_position", 0))
+        cur_ms = int(pos * 60000); tot_ms = int(dur * 60000)
+        start  = t - cur_ms; end = start + tot_ms
+        tid  = "0VjIjW4GlUZAMYd2vXMi3b"
+        aid  = "4yP0hdKOZPNshxUOjY0cZj"
+        arid = "1Xyo4u8uXC1ZmMpatF05PJ"
+        asset_key = await img(None)
+        act = {
+            "type": 2, "name": "Spotify",
+            "timestamps": {"start": start, "end": end},
+            "application_id": "3201606009684",
+            "sync_id": tid, "session_id": f"spotify:{tid}",
+            "party": {"id": f"spotify:{tid}", "size": [1, 1]},
+            "secrets": {"join": tid, "spectate": tid, "match": tid},
+            "instance": True, "flags": 48,
+            "metadata": {"context_uri": f"spotify:album:{aid}", "album_id": aid,
+                         "artist_ids": [arid], "track_id": tid},
+            **( {"assets": mk_assets(asset_key, f"{album} on Spotify" if album else "")} if (asset_key or album) else {} ),
+        }
+        mk_buttons(act)
+        return act
+
+    if rpc_type == "youtube":
+        title = cmd.get("video_title", "Video")[:128]
+        ch    = cmd.get("channel_name", "Channel")[:128]
+        el    = float(cmd.get("elapsed_minutes", 0))
+        tot   = float(cmd.get("duration_minutes", 10))
+        asset_key = await img(None)
+        act = {
+            "type": 3, "name": "YouTube",
+            "details": title, "state": ch,
+            "application_id": "111299001912",
+            "timestamps": ts_prog(el, tot) if tot else ts_now(),
+            **( {"assets": mk_assets(asset_key)} if mk_assets(asset_key) else {} ),
+        }
+        mk_buttons(act)
+        return act
+
+    if rpc_type == "xbox":
+        game = cmd.get("game_name", "Game")[:128]
+        asset_key = await img(None)
+        act = {
+            "type": 0, "name": game,
+            "application_id": "622174530214821906",
+            "platform": "xbox", "timestamps": ts_now(),
+            **( {"assets": mk_assets(asset_key)} if mk_assets(asset_key) else {} ),
+        }
+        if cmd.get("details"): act["details"] = cmd["details"][:128]
+        if cmd.get("state"):   act["state"]   = cmd["state"][:128]
+        pc, pm = cmd.get("party_cur"), cmd.get("party_max")
+        if pc and pm: act["party"] = {"id": "xbox-party", "size": [int(pc), int(pm)]}
+        mk_buttons(act)
+        return act
+
+    if rpc_type in ("playstation", "ps4", "ps5"):
+        game = cmd.get("game_name", "Game")[:128]
+        plat = cmd.get("platform", "ps5")
+        asset_key = await img(None)
+        act = {
+            "type": 0, "name": game,
+            "application_id": "1470539864909943067",
+            "platform": plat, "timestamps": ts_now(),
+            **( {"assets": mk_assets(asset_key)} if mk_assets(asset_key) else {} ),
+        }
+        if cmd.get("details"): act["details"] = cmd["details"][:128]
+        if cmd.get("state"):   act["state"]   = cmd["state"][:128]
+        pc, pm = cmd.get("party_cur"), cmd.get("party_max")
+        if pc and pm: act["party"] = {"id": "ps-party", "size": [int(pc), int(pm)]}
+        mk_buttons(act)
+        return act
+
+    if rpc_type == "crunchyroll":
+        anime = cmd.get("anime_title", "Anime")[:128]
+        ep    = cmd.get("episode_title", "")[:128]
+        el    = float(cmd.get("elapsed_minutes", 0))
+        tot   = float(cmd.get("total_minutes", 24))
+        asset_key = await img(None)
+        act = {
+            "type": 3, "name": "Crunchyroll",
+            "details": anime,
+            "application_id": "981509069309354054",
+            "timestamps": ts_prog(el, tot),
+            **( {"assets": mk_assets(asset_key)} if mk_assets(asset_key) else {} ),
+        }
+        if ep: act["state"] = ep
+        mk_buttons(act)
+        return act
+
+    if rpc_type == "playing":
+        name   = cmd.get("name", "Game")[:128]
+        app_id = cmd.get("app_id") or "367827983903490050"
+        asset_key = await img(None)
+        act = {
+            "type": 0, "name": name,
+            "application_id": app_id, "timestamps": ts_now(),
+            **( {"assets": mk_assets(asset_key)} if mk_assets(asset_key) else {} ),
+        }
+        if cmd.get("details"): act["details"] = cmd["details"][:128]
+        if cmd.get("state"):   act["state"]   = cmd["state"][:128]
+        pc, pm = cmd.get("party_cur"), cmd.get("party_max")
+        if pc and pm: act["party"] = {"id": "game-party", "size": [int(pc), int(pm)]}
+        mk_buttons(act)
+        return act
+
+    if rpc_type == "watching":
+        name   = cmd.get("name", "Show")[:128]
+        app_id = cmd.get("app_id") or "367827983903490050"
+        el     = float(cmd.get("elapsed_minutes", 0))
+        tot    = float(cmd.get("total_minutes", 0))
+        asset_key = await img(None)
+        act = {
+            "type": 3, "name": name,
+            "application_id": app_id,
+            **( {"assets": mk_assets(asset_key)} if mk_assets(asset_key) else {} ),
+        }
+        if cmd.get("details"): act["details"] = cmd["details"][:128]
+        if cmd.get("state"):   act["state"]   = cmd["state"][:128]
+        if tot: act["timestamps"] = ts_prog(el, tot)
+        mk_buttons(act)
+        return act
+
+    if rpc_type == "listening":
+        name   = cmd.get("name", "Music")[:128]
+        app_id = cmd.get("app_id") or "534203414247112723"
+        el     = float(cmd.get("elapsed_minutes", 0))
+        tot    = float(cmd.get("total_minutes", 0))
+        asset_key = await img(None)
+        act = {
+            "type": 2, "name": name,
+            "application_id": app_id,
+            **( {"assets": mk_assets(asset_key)} if mk_assets(asset_key) else {} ),
+        }
+        if cmd.get("details"): act["details"] = cmd["details"][:128]
+        if cmd.get("state"):   act["state"]   = cmd["state"][:128]
+        if tot: act["timestamps"] = ts_prog(el, tot)
+        mk_buttons(act)
+        return act
+
+    if rpc_type == "streaming":
+        name   = cmd.get("name", "Stream")[:128]
+        app_id = cmd.get("app_id") or "111299001912"
+        url    = cmd.get("stream_url") or "https://twitch.tv/kaicenat"
+        asset_key = await img(None)
+        act = {
+            "type": 1, "name": name, "url": url,
+            "application_id": app_id, "timestamps": ts_now(),
+            **( {"assets": mk_assets(asset_key)} if mk_assets(asset_key) else {} ),
+        }
+        if cmd.get("details"): act["details"] = cmd["details"][:128]
+        if cmd.get("state"):   act["state"]   = cmd["state"][:128]
+        mk_buttons(act)
+        return act
+
+    if rpc_type == "competing":
+        name   = cmd.get("name", "Tournament")[:128]
+        app_id = cmd.get("app_id") or "367827983903490050"
+        asset_key = await img(None)
+        act = {
+            "type": 5, "name": name,
+            "application_id": app_id, "timestamps": ts_now(),
+            **( {"assets": mk_assets(asset_key)} if mk_assets(asset_key) else {} ),
+        }
+        if cmd.get("details"): act["details"] = cmd["details"][:128]
+        if cmd.get("state"):   act["state"]   = cmd["state"][:128]
+        mk_buttons(act)
+        return act
+
+    if rpc_type == "custom":
+        name     = cmd.get("name", "Activity")[:128]
+        act_type = int(cmd.get("activity_type", 0))
+        app_id   = cmd.get("app_id") or "367827983903490050"
+        act      = {"type": act_type, "name": name, "application_id": app_id}
+        if cmd.get("details"): act["details"] = cmd["details"][:128]
+        if cmd.get("state"):   act["state"]   = cmd["state"][:128]
+        if act_type == 1 and cmd.get("stream_url"): act["url"] = cmd["stream_url"]
+        li_url = cmd.get("large_image", "")
+        si_url = cmd.get("small_image", "")
+        if li_url or si_url:
+            act["assets"] = {}
+            if li_url:
+                act["assets"]["large_image"] = li_url
+                act["assets"]["large_text"]  = cmd.get("large_text", name)[:128]
+            if si_url:
+                act["assets"]["small_image"] = si_url
+                act["assets"]["small_text"]  = cmd.get("small_text", "")[:128]
+        el    = float(cmd.get("elapsed_minutes", 0))
+        tot_v = cmd.get("total_minutes")
+        act["timestamps"] = ts_prog(el, float(tot_v)) if tot_v else ts_now()
+        pc, pm = cmd.get("party_cur"), cmd.get("party_max")
+        if pc and pm: act["party"] = {"id": "custom-party", "size": [int(pc), int(pm)]}
+        mk_buttons(act)
+        return act
+
+    return None
+
+
+async def _build_and_send(handler, cmd: dict):
+    http    = handler.http
+    spoofer = handler.spoofer
+    rpc_type = cmd.get("rpc_type", "").lower()
+    if rpc_type == "clear":
+        await _send_payload(handler, [])
+        return
+    act = await _build_activity(handler, cmd)
+    if act is None:
+        return
+    merged = []
+    for rt, existing_cmd in list(_active_cmd.items()):
+        if rt == rpc_type:
+            continue
+        existing_act = await _build_activity(handler, existing_cmd)
+        if existing_act:
+            merged.append(existing_act)
+    merged.append(act)
+    await _send_payload(handler, merged)
+    return
+def setup(handler):
+    import sys as _sys
+    handler._rpc_module = _sys.modules[__name__]
+    prefix = handler.prefix
+
+    # Register hook so gateway._presence_keepalive knows to back off
+    def _get_active_activities():
+        return _active_cmd.copy() if _active_cmd else None
+    handler._get_active_activities = _get_active_activities
+
+    # -- Reapply RPC on every reconnect / ready --------------------------------
+    _orig_on_ready = getattr(handler, "on_ready", None)
+    async def _on_ready_hook():
+        if _orig_on_ready:
+            await _orig_on_ready()
+        if _active_cmd:
+            await asyncio.sleep(3)
+            try:
+                acts = []
+                for rt_cmd in list(_active_cmd.values()):
+                    a = await _build_activity(handler, rt_cmd)
+                    if a:
+                        acts.append(a)
+                if acts:
+                    await _send_payload(handler, acts)
+                print("[RPC] Reapplied presence after reconnect")
+            except Exception as e:
+                print(f"[RPC] Reapply failed: {e}")
+    handler.on_ready = _on_ready_hook
+
+    # -- Keepalive loop - resend every 25 minutes so Discord never drops it ----
+    # FIX: guard against spawning multiple keepalive loops (e.g. if setup() is
+    # called again on a hosted account reload). Track the task on the handler.
+    if not getattr(handler, "_rpc_keepalive_task", None):
+        async def _keepalive_loop():
+            while True:
+                await asyncio.sleep(_KEEPALIVE_INTERVAL)
+                if not _active_cmd:
+                    continue
+                # Check gateway is actually alive before sending
+                gateway = getattr(handler, "gateway", None)
+                ws = getattr(gateway, "_ws", None) if gateway else None
+                if not ws:
+                    print("[RPC] keepalive: no ws, skipping")
+                    continue
+                try:
+                    acts = []
+                    for rt_cmd in list(_active_cmd.values()):
+                        a = await _build_activity(handler, rt_cmd)
+                        if a:
+                            acts.append(a)
+                    if acts:
+                        await _send_payload(handler, acts)
+                    print("[RPC] keepalive resent presence")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    print(f"[RPC] keepalive failed: {e}")
+
+        handler._rpc_keepalive_task = handler._spawn(_keepalive_loop())
+
+    def _parse_kv(args: list) -> dict:
+        cmd = {}
+        if not args:
+            return cmd
+        cmd["rpc_type"] = args[0].lower()
+        raw = " ".join(args[1:]).strip()
+        if not raw:
+            return cmd
+        tokens = re.split(r'(?:(?:^| )([a-zA-Z_]\w*)=)', raw)
+        i = 1
+        while i < len(tokens) - 1:
+            k = tokens[i]
+            if not k:
+                i += 2
+                continue
+            v = tokens[i + 1].strip() if tokens[i + 1] else ""
+            if k in ("buttons", "button_urls"):
+                cmd.setdefault(k, []).append(v)
+            else:
+                cmd[k] = v
+            i += 2
+        return cmd
+
+    @handler.command(name="rpc")
+    async def rpc(ctx, args):
+        await ctx.delete()
+        if not args:
+            await ctx.send_timed(ansi.command_usage("rpc", *COMMANDS_INFO["rpc"], prefix), 15)
+            return
+        cmd = _parse_kv(args)
+        rpc_type = cmd.get("rpc_type", "")
+        if rpc_type not in _RPC_TYPES:
+            await ctx.send_timed(ansi.error(f"Unknown type **{rpc_type}**. Types: {', '.join(_RPC_TYPES)}"), 15)
+            return
+        try:
+            await _build_and_send(handler, cmd)
+        except Exception as e:
+            await ctx.send_timed(ansi.error(f"Failed: {e}"), 10)
+            return
+        if rpc_type == "clear":
+            _active_cmd.clear()
+            await ctx.send_timed(ansi.success("Rich presence cleared."), 10)
+        else:
+            _active_cmd[rpc_type] = cmd
+            active_types = ", ".join(_active_cmd.keys())
+            await ctx.send_timed(ansi.success(f"RPC set to **{rpc_type}**. Active: {active_types}. Keepalive active (resends every 25m)."), 10)
+            # resend after 2s - Discord sometimes drops the first op 3
+            await asyncio.sleep(2)
+            try:
+                await _build_and_send(handler, cmd)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+
+    @handler.command(name="rpcstop")
+    async def rpcstop(ctx, args):
+        await ctx.delete()
+        try:
+            await _send_payload(handler, [])
+            _active_cmd.clear()
+            await ctx.send_timed(ansi.success("Rich presence cleared."), 10)
+        except Exception as e:
+            await ctx.send_timed(ansi.error(f"Failed: {e}"), 10)
+
+    @handler.command(name="rpchelp")
+    async def rpchelp(ctx, args):
+        await ctx.delete()
+        R = "\u001b[0m"
+        _usage = {
+            "custom_status": "rpc custom_status text=<text> [emoji=<emoji>] [invisible=true]",
+            "playing":       "rpc playing name=<game> [details=<d>] [state=<s>] [image_url=<url>]",
+            "watching":      "rpc watching name=<show> [details=<d>] [state=<s>] [elapsed_minutes=N] [total_minutes=N] [image_url=<url>]",
+            "listening":     "rpc listening name=<music> [details=<d>] [state=<s>] [elapsed_minutes=N] [total_minutes=N]",
+            "streaming":     "rpc streaming name=<title> [stream_url=<url>] [details=<d>] [state=<s>]",
+            "competing":     "rpc competing name=<tournament> [details=<d>] [state=<s>]",
+            "spotify":       "rpc spotify song=<title> artist=<artist> [album=<a>] [duration=3.5] [current_position=0] [image_url=<url>]",
+            "youtube":       "rpc youtube video_title=<t> channel_name=<ch> [elapsed_minutes=N] [duration_minutes=N] [image_url=<url>]",
+            "xbox":          "rpc xbox game_name=<game> [details=<d>] [state=<s>] [image_url=<url>]",
+            "playstation":   "rpc playstation game_name=<game> [platform=ps5] [details=<d>] [state=<s>] [image_url=<url>]",
+            "crunchyroll":   "rpc crunchyroll anime_title=<a> episode_title=<ep> [elapsed_minutes=N] [total_minutes=24] [image_url=<url>]",
+            "custom":        "rpc custom name=<n> [activity_type=0] [app_id=<id>] [details=<d>] [state=<s>] [large_image=<url>] [small_image=<url>]",
+            "clear":         "rpc clear",
+        }
+        if not args:
+            lines = [f"{ansi.CYAN}{tp}{R}" for tp in _RPC_TYPES]
+            from ansi import _block
+            await ctx.send_timed(_block("  ".join(lines)), 20)
+            return
+        t = args[0].lower()
+        usage = _usage.get(t)
+        if not usage:
+            await ctx.send_timed(ansi.error(f"Unknown type **{t}**."), 10)
+            return
+        from ansi import _block
+        await ctx.send_timed(_block(f"{ansi.CYAN}{t}{R}\n{ansi.WHITE}{usage}{R}"), 20)

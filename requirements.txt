@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pydantic
+websockets
+aiohttp
+curl-cffi
+watchfiles
+httpx
